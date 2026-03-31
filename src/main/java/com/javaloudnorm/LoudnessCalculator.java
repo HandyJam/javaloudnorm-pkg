@@ -2,6 +2,7 @@ package com.javaloudnorm;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.IntStream;
 
 public final class LoudnessCalculator {
     private static final double[] DEFAULT_G = {1.0, 1.0, 1.0, 1.41, 1.41};
@@ -13,34 +14,61 @@ public final class LoudnessCalculator {
         return calculateLoudness(signal, fs, DEFAULT_G);
     }
 
-    public static double calculateLoudness(double[][] signal, double fs, double[] g) {
-        double[][] signalFiltered = copyMatrix(signal);
-
-        for (int i = 0; i < signalFiltered[0].length; i++) {
-            double[] channel = extractColumn(signalFiltered, i);
-            double[] filteredChannel = KFilter.kFilter(channel, fs);
-            writeColumn(signalFiltered, i, filteredChannel);
+    public static double calculateLoudness(double[][] channelsSamples, double fs, double[] g) {
+        // channelsSamples is double[channels][frames]
+        double[][] channelsFiltered = new double[channelsSamples.length][];
+        if (channelsSamples.length == 1) {
+            channelsFiltered[0] = KFilter.kFilter(channelsSamples[0], fs);
+        } else {
+            IntStream.range(0, channelsSamples.length).parallel().forEach(i -> {
+                channelsFiltered[i] = KFilter.kFilter(channelsSamples[i], fs);
+            });
         }
 
         double tg = 0.400;
         double gammaA = -70.0;
         double overlap = 0.75;
-        double step = 1.0 - overlap;
+        double step = 1 - overlap;
 
-        double totalTime = signalFiltered.length / fs;
+        double totalTime = channelsFiltered[0].length / fs;
         int[] jRange = createWindowRange(totalTime, tg, step);
-        double[][] z = new double[signalFiltered[0].length][jRange.length];
-
-        for (int i = 0; i < signalFiltered[0].length; i++) {
+        double[][] z = new double[channelsFiltered.length][];
+        IntStream.range(0, channelsFiltered.length).parallel().forEach(i -> {
+            double[] chan = channelsFiltered[i];
+            double[] zChan = new double[jRange.length];
             for (int jIndex = 0; jIndex < jRange.length; jIndex++) {
                 int j = jRange[jIndex];
                 int lowerBound = (int) Math.round(fs * tg * j * step);
                 int upperBound = (int) Math.round(fs * tg * (j * step + 1.0));
-                z[i][jIndex] = (1.0 / (tg * fs)) * sumSquares(signalFiltered, lowerBound, upperBound, i);
+                double sum = 0.0;
+                int safeUpper = Math.min(upperBound, chan.length);
+                int len = safeUpper - lowerBound;
+                if (len > 0) {
+                    int m = len / 4;
+                    double sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+                    int base = lowerBound;
+                    for (int k = 0; k < m; k++) {
+                        double v0 = chan[base++];
+                        double v1 = chan[base++];
+                        double v2 = chan[base++];
+                        double v3 = chan[base++];
+                        sum0 += v0 * v0;
+                        sum1 += v1 * v1;
+                        sum2 += v2 * v2;
+                        sum3 += v3 * v3;
+                    }
+                    sum = sum0 + sum1 + sum2 + sum3;
+                    for (int k = m * 4; k < len; k++) {
+                        double value = chan[lowerBound + k];
+                        sum += value * value;
+                    }
+                }
+                zChan[jIndex] = sum / (tg * fs);
             }
-        }
+            z[i] = zChan;
+        });
 
-        double[] currentG = new double[Math.min(g.length, signalFiltered[0].length)];
+        double[] currentG = new double[Math.min(g.length, channelsFiltered.length)];
         System.arraycopy(g, 0, currentG, 0, currentG.length);
         int nChannels = currentG.length;
 
@@ -90,28 +118,6 @@ public final class LoudnessCalculator {
         return -0.691 + 10.0 * Math.log10(loudnessSum);
     }
 
-    private static double[][] copyMatrix(double[][] source) {
-        double[][] copy = new double[source.length][source[0].length];
-        for (int i = 0; i < source.length; i++) {
-            System.arraycopy(source[i], 0, copy[i], 0, source[i].length);
-        }
-        return copy;
-    }
-
-    private static double[] extractColumn(double[][] matrix, int column) {
-        double[] values = new double[matrix.length];
-        for (int i = 0; i < matrix.length; i++) {
-            values[i] = matrix[i][column];
-        }
-        return values;
-    }
-
-    private static void writeColumn(double[][] matrix, int column, double[] values) {
-        for (int i = 0; i < matrix.length; i++) {
-            matrix[i][column] = values[i];
-        }
-    }
-
     private static int[] createWindowRange(double totalTime, double tg, double step) {
         int length = (int) ((totalTime - tg) / (tg * step));
         if (length <= 0) {
@@ -124,15 +130,6 @@ public final class LoudnessCalculator {
         return range;
     }
 
-    private static double sumSquares(double[][] signal, int lowerBound, int upperBound, int channel) {
-        double sum = 0.0;
-        int safeUpper = Math.min(upperBound, signal.length);
-        for (int i = lowerBound; i < safeUpper; i++) {
-            double value = signal[i][channel];
-            sum += value * value;
-        }
-        return sum;
-    }
 
     private static double mean(double[] values, List<Integer> indices) {
         if (indices.isEmpty()) {

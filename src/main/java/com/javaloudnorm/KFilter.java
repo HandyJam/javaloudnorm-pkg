@@ -32,26 +32,20 @@ public final class KFilter {
     }
 
     public static double[] lfilter(double[] b, double[] a, double[] signal) {
-        double[] output = new double[signal.length];
-
-        for (int n = 0; n < signal.length; n++) {
-            double value = 0.0;
-
-            for (int i = 0; i < b.length; i++) {
-                if (n - i >= 0) {
-                    value += b[i] * signal[n - i];
-                }
-            }
-
-            for (int i = 1; i < a.length; i++) {
-                if (n - i >= 0) {
-                    value -= a[i] * output[n - i];
-                }
-            }
-
-            output[n] = value / a[0];
+        int n = signal.length;
+        double[] output = new double[n];
+        double a0 = a[0];
+        if (n > 0) {
+            output[0] = b[0] * signal[0] / a0;
         }
-
+        if (n > 1) {
+            output[1] = (b[0] * signal[1] + b[1] * signal[0] - a[1] * output[0]) / a0;
+        }
+        for (int i = 2; i < n; i++) {
+            double feedforward = b[0] * signal[i] + b[1] * signal[i - 1] + b[2] * signal[i - 2];
+            double feedback = a[1] * output[i - 1] + a[2] * output[i - 2];
+            output[i] = (feedforward - feedback) / a0;
+        }
         return output;
     }
 }

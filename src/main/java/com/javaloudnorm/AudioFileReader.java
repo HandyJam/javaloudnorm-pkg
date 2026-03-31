@@ -68,7 +68,7 @@ public final class AudioFileReader {
             throw new IllegalArgumentException("Unsupported PCM sample size: " + (sampleSizeBytes * 8) + " bits");
         }
 
-        double[][] samples = new double[(int) frameCount][channels];
+        double[][] samples = new double[channels][(int) frameCount];
         int frameSize = channels * sampleSizeBytes;
         double scale = Math.pow(2.0, (double) (sampleSizeBytes * 8 - 1));
 
@@ -77,7 +77,7 @@ public final class AudioFileReader {
             for (int channel = 0; channel < channels; channel++) {
                 int sampleOffset = frameOffset + channel * sampleSizeBytes;
                 int raw = readSignedSample(audioBytes, sampleOffset, sampleSizeBytes, bigEndian);
-                samples[frame][channel] = raw / scale;
+                samples[channel][frame] = raw / scale;
             }
         }
 

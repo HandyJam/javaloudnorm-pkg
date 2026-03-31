@@ -10,7 +10,7 @@ public class Main {
 //        }
 
         try {
-            String testFile = "/Users/jordy/Downloads/sample1_1.flac";
+            String testFile = "/home/jordy/Music/01 Bones.flac";
 //            AudioData audioData = AudioFileReader.read(Path.of(args[0]));
             AudioData audioData = AudioFileReader.read(Path.of(testFile));
 
