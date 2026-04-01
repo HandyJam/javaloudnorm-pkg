@@ -1,103 +1,143 @@
 package com.javaloudnorm;
 
-import javax.sound.sampled.AudioFormat;
-import javax.sound.sampled.AudioInputStream;
-import javax.sound.sampled.AudioSystem;
-import javax.sound.sampled.UnsupportedAudioFileException;
+import javax.sound.sampled.*;
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
-public final class AudioFileReader {
+/**
+ * Reads audio files into raw PCM samples using javax.sound.sampled.
+ * Supports WAV natively; MP3, FLAC, and OGG via SPI providers on the classpath.
+ */
+public class AudioFileReader {
+
     private AudioFileReader() {
     }
 
-    public static AudioData read(Path path) throws IOException, UnsupportedAudioFileException {
-        if (!Files.exists(path)) {
-            throw new IOException("File does not exist: " + path);
-        }
-
-        try (AudioInputStream sourceStream = AudioSystem.getAudioInputStream(path.toFile())) {
-            AudioFormat baseFormat = sourceStream.getFormat();
-            AudioFormat pcmFormat = toPcmSigned(baseFormat);
-
-            try (AudioInputStream pcmStream = AudioSystem.getAudioInputStream(pcmFormat, sourceStream)) {
-                byte[] audioBytes = readAllBytes(pcmStream);
-                int channels = pcmFormat.getChannels();
-                int frameSize = pcmFormat.getFrameSize();
-                int sampleSizeBytes = pcmFormat.getSampleSizeInBits() / 8;
-                long frameCount = audioBytes.length / frameSize;
-                double[][] samples = decodePcm(audioBytes, channels, sampleSizeBytes, frameCount, pcmFormat.isBigEndian());
-                return new AudioData(path, pcmFormat.getSampleRate(), channels, frameCount, samples);
-            }
-        }
+    /**
+     * Reads an audio file from a file path.
+     *
+     * @param filePath path to the audio file
+     * @return AudioData containing deinterleaved samples and sample rate
+     * @throws IOException                   if the file cannot be read
+     * @throws UnsupportedAudioFileException if the format is not supported
+     */
+    public static AudioData read(String filePath) throws IOException, UnsupportedAudioFileException {
+        AudioInputStream originalStream = AudioSystem.getAudioInputStream(new File(filePath));
+        return decodeStream(originalStream);
     }
 
-    private static AudioFormat toPcmSigned(AudioFormat format) {
-        if (AudioFormat.Encoding.PCM_SIGNED.equals(format.getEncoding())) {
-            return format;
+    /**
+     * Reads audio from an InputStream.
+     * The stream must support mark/reset (e.g. BufferedInputStream) for format detection.
+     * If it does not, it will be wrapped in a BufferedInputStream automatically.
+     *
+     * @param inputStream the audio input stream
+     * @return AudioData containing deinterleaved samples and sample rate
+     * @throws IOException                   if the stream cannot be read
+     * @throws UnsupportedAudioFileException if the format is not supported
+     */
+    public static AudioData read(InputStream inputStream) throws IOException, UnsupportedAudioFileException {
+        InputStream buffered = inputStream.markSupported() ? inputStream : new BufferedInputStream(inputStream);
+        AudioInputStream originalStream = AudioSystem.getAudioInputStream(buffered);
+        return decodeStream(originalStream);
+    }
+
+    private static AudioData decodeStream(AudioInputStream originalStream) throws IOException, UnsupportedAudioFileException {
+        AudioFormat originalFormat = originalStream.getFormat();
+
+        // Decode to PCM signed 16-bit little-endian (universally supported target)
+        AudioFormat decodedFormat = new AudioFormat(
+                AudioFormat.Encoding.PCM_SIGNED,
+                originalFormat.getSampleRate(),
+                16,
+                originalFormat.getChannels(),
+                originalFormat.getChannels() * 2,
+                originalFormat.getSampleRate(),
+                false // little-endian
+        );
+
+        AudioInputStream decodedStream;
+        if (AudioSystem.isConversionSupported(decodedFormat, originalFormat)) {
+            decodedStream = AudioSystem.getAudioInputStream(decodedFormat, originalStream);
+        } else {
+            // Already PCM — try to use as-is, converting bit depth if needed
+            decodedStream = originalStream;
+            decodedFormat = originalFormat;
         }
 
-        int sampleSize = format.getSampleSizeInBits() > 0 ? format.getSampleSizeInBits() : 16;
-        int channels = format.getChannels();
-        float sampleRate = format.getSampleRate();
-        return new AudioFormat(
-                AudioFormat.Encoding.PCM_SIGNED,
-                sampleRate,
-                sampleSize,
-                channels,
-                channels * (sampleSize / 8),
-                sampleRate,
-                false
-        );
+        // Read all bytes
+        byte[] allBytes = readAllBytes(decodedStream);
+        decodedStream.close();
+        originalStream.close();
+
+        int channels = decodedFormat.getChannels();
+        int sampleRate = (int) decodedFormat.getSampleRate();
+        int sampleSizeInBits = decodedFormat.getSampleSizeInBits();
+        boolean bigEndian = decodedFormat.isBigEndian();
+        int bytesPerSample = sampleSizeInBits / 8;
+        int frameSize = channels * bytesPerSample;
+        int numFrames = allBytes.length / frameSize;
+
+        // Deinterleave and normalize to [-1.0, 1.0]
+        double[][] samples = new double[channels][numFrames];
+        ByteBuffer buffer = ByteBuffer.wrap(allBytes).order(bigEndian ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN);
+
+        for (int frame = 0; frame < numFrames; frame++) {
+            for (int ch = 0; ch < channels; ch++) {
+                double sample;
+                switch (sampleSizeInBits) {
+                    case 8:
+                        // 8-bit PCM is unsigned
+                        sample = (buffer.get() & 0xFF) / 128.0 - 1.0;
+                        break;
+                    case 16:
+                        sample = buffer.getShort() / 32768.0;
+                        break;
+                    case 24:
+                        int b0 = buffer.get() & 0xFF;
+                        int b1 = buffer.get() & 0xFF;
+                        int b2 = buffer.get() & 0xFF;
+                        int value;
+                        if (bigEndian) {
+                            value = (b0 << 16) | (b1 << 8) | b2;
+                        } else {
+                            value = (b2 << 16) | (b1 << 8) | b0;
+                        }
+                        // Sign extend from 24 bits
+                        if (value >= 0x800000) {
+                            value -= 0x1000000;
+                        }
+                        sample = value / 8388608.0;
+                        break;
+                    case 32:
+                        if (decodedFormat.getEncoding() == AudioFormat.Encoding.PCM_FLOAT) {
+                            sample = buffer.getFloat();
+                        } else {
+                            sample = buffer.getInt() / 2147483648.0;
+                        }
+                        break;
+                    default:
+                        throw new UnsupportedAudioFileException("Unsupported sample size: " + sampleSizeInBits + " bits");
+                }
+                samples[ch][frame] = sample;
+            }
+        }
+
+        return new AudioData(samples, sampleRate);
     }
 
     private static byte[] readAllBytes(AudioInputStream stream) throws IOException {
-        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-        byte[] chunk = new byte[8192];
-        int read;
-        while ((read = stream.read(chunk)) != -1) {
-            buffer.write(chunk, 0, read);
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int bytesRead;
+        while ((bytesRead = stream.read(buf)) != -1) {
+            baos.write(buf, 0, bytesRead);
         }
-        return buffer.toByteArray();
-    }
-
-    private static double[][] decodePcm(byte[] audioBytes, int channels, int sampleSizeBytes, long frameCount, boolean bigEndian) {
-        if (sampleSizeBytes != 2 && sampleSizeBytes != 3 && sampleSizeBytes != 4) {
-            throw new IllegalArgumentException("Unsupported PCM sample size: " + (sampleSizeBytes * 8) + " bits");
-        }
-
-        double[][] samples = new double[channels][(int) frameCount];
-        int frameSize = channels * sampleSizeBytes;
-        double scale = Math.pow(2.0, (double) (sampleSizeBytes * 8 - 1));
-
-        for (int frame = 0; frame < frameCount; frame++) {
-            int frameOffset = frame * frameSize;
-            for (int channel = 0; channel < channels; channel++) {
-                int sampleOffset = frameOffset + channel * sampleSizeBytes;
-                int raw = readSignedSample(audioBytes, sampleOffset, sampleSizeBytes, bigEndian);
-                samples[channel][frame] = raw / scale;
-            }
-        }
-
-        return samples;
-    }
-
-    private static int readSignedSample(byte[] bytes, int offset, int sampleSizeBytes, boolean bigEndian) {
-        int value = 0;
-
-        if (bigEndian) {
-            for (int i = 0; i < sampleSizeBytes; i++) {
-                value = (value << 8) | (bytes[offset + i] & 0xFF);
-            }
-        } else {
-            for (int i = sampleSizeBytes - 1; i >= 0; i--) {
-                value = (value << 8) | (bytes[offset + i] & 0xFF);
-            }
-        }
-
-        int shift = 32 - sampleSizeBytes * 8;
-        return (value << shift) >> shift;
+        return baos.toByteArray();
     }
 }
